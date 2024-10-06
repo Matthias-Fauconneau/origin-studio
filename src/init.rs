@@ -17,13 +17,3 @@ pub(crate) fn sanitize_stdio_fds() {
 pub(crate) unsafe fn store_args(argc: i32, argv: *mut *mut u8, envp: *mut *mut u8) {
     crate::env::MAIN_ARGS = crate::env::MainArgs { argc, argv, envp };
 }
-
-pub(crate) unsafe fn reset_sigpipe() {
-    use core::mem::zeroed;
-    use origin::signal::{sig_ign, sigaction, Sigaction, Signal, SA_RESTART};
-
-    let mut action = zeroed::<Sigaction>();
-    action.sa_handler_kernel = sig_ign();
-    action.sa_flags = SA_RESTART;
-    sigaction(Signal::Pipe, Some(action)).unwrap();
-}

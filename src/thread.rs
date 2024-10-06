@@ -4,11 +4,12 @@ use crate::boxed::Box;
 use crate::io;
 use core::mem::forget;
 use core::num::NonZeroUsize;
-use core::ptr::{null_mut, NonNull};
+use core::ptr::NonNull;
+use core::marker::PhantomData;
 
 // Rust does't need the OS tids, it just needs unique ids, so we just use the
 // raw `Thread` value casted to `usize`.
-pub struct ThreadId(usize);
+pub struct ThreadId(#[allow(dead_code)] usize);
 
 pub struct Thread(origin::thread::Thread);
 
@@ -18,12 +19,15 @@ impl Thread {
     }
 }
 
-pub struct JoinHandle(Thread);
+pub struct JoinHandle<'scope> {
+	pub thread: Thread,
+	_marker: PhantomData<&'scope ()>,
+}
 
-impl JoinHandle {
+impl JoinHandle<'_> {
     pub fn join(self) -> io::Result<()> {
         unsafe {
-            origin::thread::join(self.0 .0);
+            origin::thread::join(self.thread .0);
         }
 
         // Don't call drop, which would detach the thread we just joined.
@@ -33,58 +37,48 @@ impl JoinHandle {
     }
 }
 
-impl Drop for JoinHandle {
+impl Drop for JoinHandle<'_> {
     fn drop(&mut self) {
         unsafe {
-            origin::thread::detach(self.0 .0);
+            origin::thread::detach(self.thread .0);
         }
     }
 }
 
-pub fn spawn<F>(f: F) -> JoinHandle
-where
-    F: FnOnce() + Send + 'static,
-{
+pub fn spawn<F: FnOnce() + Send + 'static>(f: F) -> JoinHandle<'static> { spawn_unchecked(f, None) }
+pub fn spawn_unchecked<'scope, F: FnOnce() + Send>(f: F, scope: Option<&Scope>) -> JoinHandle<'scope> {
     // Pack up the closure.
-    let boxed: Box<dyn FnOnce() + Send + 'static> = Box::new(move || {
-        #[cfg(feature = "stack-overflow")]
-        let _handler = unsafe { crate::stack_overflow::Handler::new() };
-
+    let boxed = Box::new(move || {
+        #[cfg(feature = "stack-overflow")] let _ = unsafe { crate::stack_overflow::Handler::new() };
         f()
     });
-
-    // We could avoid double boxing by enabling the unstable `ptr_metadata`
-    // feature, using `.to_raw_parts()` on the box pointer, though it does
-    // also require transmuting the metadata into `*mut c_void` and back.
-    /*
-    let raw: *mut (dyn FnOnce() + Send + 'static) = Box::into_raw(boxed);
+    
+    let raw = Box::into_raw(boxed) as *mut (dyn FnOnce() + Send + 'static);
     let (callee, metadata) = raw.to_raw_parts();
     let args = [
         NonNull::new(callee as _),
-        NonNull::new(unsafe { transmute(metadata) }),
+        NonNull::new(unsafe { core::mem::transmute(metadata) }),
+        NonNull::new(Box::into_raw(Box::new(scope)).cast())
     ];
-    */
-    let boxed = Box::new(boxed);
-    let raw: *mut Box<dyn FnOnce() + Send + 'static> = Box::into_raw(boxed);
-    let args = [NonNull::new(raw.cast())];
 
     let thread = unsafe {
         let r = origin::thread::create(
             move |args| {
                 // Unpack and call.
-                /*
+
                 let (callee, metadata) = (args[0], args[1]);
                 let raw: *mut (dyn FnOnce() + Send + 'static) =
-                    ptr::from_raw_parts_mut(transmute(callee), transmute(metadata));
+                    core::ptr::from_raw_parts_mut(core::mem::transmute::<_,*mut ()>(callee), core::mem::transmute(metadata));
                 let boxed = Box::from_raw(raw);
                 boxed();
-                */
-                let raw: *mut Box<dyn FnOnce() + Send + 'static> = match args[0] {
-                    Some(raw) => raw.as_ptr().cast(),
-                    None => null_mut(),
-                };
-                let boxed: Box<Box<dyn FnOnce() + Send + 'static>> = Box::from_raw(raw);
-                (*boxed)();
+
+                let scope: Box<Option<&Scope>> = Box::from_raw(args[2].unwrap().as_ptr().cast());
+
+                if let Some(scope) = *scope {
+	                if scope.num_running_threads.fetch_sub(1, core::sync::atomic::Ordering::Release) == 1 {
+	                    scope.main_thread.unpark();
+	                }
+                }
 
                 None
             },
@@ -95,7 +89,7 @@ where
         r.unwrap()
     };
 
-    JoinHandle(Thread(thread))
+    JoinHandle{thread: Thread(thread), _marker: PhantomData}
 }
 
 pub fn current() -> Thread {
@@ -115,3 +109,14 @@ unsafe impl rustix_futex_sync::lock_api::GetThreadId for GetThreadId {
 pub(crate) type ReentrantMutex<T> = rustix_futex_sync::ReentrantMutex<GetThreadId, T>;
 pub(crate) type ReentrantMutexGuard<'a, T> =
     rustix_futex_sync::ReentrantMutexGuard<'a, GetThreadId, T>;
+
+pub fn park() { rustix::process::sched_yield() }
+pub fn park_timeout(_time: u64) { park() }
+
+impl Thread {
+	pub fn unpark(&self) {}
+}
+
+mod scoped;
+
+pub use scoped::{Scope, scope};

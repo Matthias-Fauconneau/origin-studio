@@ -3,6 +3,7 @@
 #![feature(lang_items)]
 #![feature(core_intrinsics)]
 #![feature(strict_provenance)]
+#![feature(ptr_metadata)]
 #![deny(fuzzy_provenance_casts, lossy_provenance_casts)]
 #![no_std]
 
@@ -19,7 +20,8 @@ fn panic(panic: &core::panic::PanicInfo<'_>) -> ! {
 
     #[cfg(feature = "std")]
     {
-        eprintln!("{}", panic);
+        //eprintln!("{}", panic);
+        println!("{}:{}: {}", panic.location().unwrap().file(), panic.location().unwrap().line(), panic.message());
     }
     #[cfg(all(not(feature = "std"), feature = "atomic-dbg"))]
     {
@@ -48,9 +50,8 @@ unsafe fn origin_main(argc: i32, argv: *mut *mut u8, envp: *mut *mut u8) -> i32 
         crate::init::sanitize_stdio_fds();
         crate::init::store_args(argc, argv, envp);
     }
+    #[cfg(feature = "stack-overflow")]
     unsafe {
-        crate::init::reset_sigpipe();
-        #[cfg(feature = "stack-overflow")]
         crate::stack_overflow::init();
     }
 
